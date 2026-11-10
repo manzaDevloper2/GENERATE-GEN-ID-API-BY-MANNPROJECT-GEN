@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.env
+venv/
+.venv/
+.DS_Store
+nohup.out
+*.zip
+*.tar.gz
+*.whl
+*.egg-info/
