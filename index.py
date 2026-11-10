@@ -1,5 +1,5 @@
 """
-cleanup.py — Auto cleanup storage untuk Render.com
+cleanup.py  Auto cleanup storage untuk Render.com
 - Hapus file temp, cache, log lama
 - Hapus file > N hari
 - Hapus __pycache__ otomatis
