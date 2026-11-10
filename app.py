@@ -1,214 +1,66 @@
-from flask import Flask, request, jsonify, make_response
-import os, sys, time, threading, json, random, requests, re, codecs, base64, hmac, hashlib, string, logging
-from datetime import datetime
+from flask import Flask, request, jsonify
+import hmac
+import hashlib
+import requests
+import string
+import random
+import secrets
+import json
+import base64
+import re
+import os
+import time
+import threading
+import uuid
+import ipaddress
+import concurrent.futures
+from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import urllib3
-import concurrent.futures
 
-urllib3.disable_warnings()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ========== LOGGING ==========
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', stream=sys.stdout)
-log = logging.getLogger("ffgen")
+# ═══ TAHAP 1 PATCH — IMPORT CLEANUP MODULE ═══
+try:
+    from cleanup import start_cleanup_thread, run_cleanup, get_cleanup_stats
+    _CLEANUP_OK = True
+except Exception as _e:
+    print(f"[!] cleanup module not loaded: {_e}")
+    _CLEANUP_OK = False
+# ═══ END TAHAP 1 PATCH ═══
 
-# ========== OWNER & ENV CONFIG ==========
-OWNER_NAME = "MANNPROJECTGEN"
-OWNER_WA   = "6285165918835 & 6285746054082"
+app = Flask(__name__)
 
-KV_URL = os.environ.get("KV_REST_API_URL", "")
-KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
-HAS_KV = bool(KV_URL and KV_TOKEN)
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
 
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
-HAS_TG   = bool(TG_TOKEN and TG_CHAT)
+APP_ID         = 100067
+RELEASE_VER    = "OB55"
+GAME_VERSION   = "2.132.4"
+CLIENT_SECRET  = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+HEX_KEY        = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 
-# ========== KV & TELEGRAM HELPERS ==========
-def kv_cmd(cmd_list):
-    if not HAS_KV: return None
-    try:
-        r = requests.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=cmd_list, timeout=3)
-        if r.status_code == 200: return r.json().get("result")
-    except: pass
-    return None
+URL_GUEST_REGISTER = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
+URL_TOKEN_GRANT    = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
+URL_MAJOR_LOGIN    = "https://loginbp.ppmainecoonghj.com/MajorLogin"
+URL_MAJOR_REGISTER = "https://loginbp.ppmainecoonghj.com/MajorRegister"
+URL_NEWBIE_CHOICE  = "https://loginbp.ppmainecoonghj.com/ChooseNewbieChoice"
 
-def kv_incr(key):
-    if not HAS_KV: return 0
-    try:
-        res = kv_cmd(["INCR", key])
-        return int(res) if res else 0
-    except: return 0
+FORCE_REGION       = "ID"
+FORCE_NAME_PREFIX  = "MANN"
+FORCE_PASS_PREFIX  = "MANN_"
 
-def kv_get(key):
-    if not HAS_KV: return 0
-    try:
-        res = kv_cmd(["GET", key])
-        return int(res) if res else 0
-    except: return 0
+REGION_LANG = {
+    "ME": "ar", "IND": "hi", "ID": "id", "JP": "ja",
+    "VN": "vi", "TH": "th", "BD": "bn", "PK": "ur",
+    "TW": "zh", "CIS": "ru", "SAC": "es", "BR": "pt",
+    "SG": "en", "US": "en", "EU": "en", "LK": "en",
+}
 
-def send_telegram(text):
-    if not HAS_TG: return False
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": TG_CHAT, "text": text}, timeout=5)
-    except: pass
-
-# ========== DEBUG BUFFER ==========
-_thread_local = threading.local()
-_debug_buffer = []
-_debug_lock = threading.Lock()
-
-def _safe(v):
-    if v is None or isinstance(v, (str, int, float, bool)): return v
-    if isinstance(v, (bytes, bytearray)):
-        try: return v.decode("utf-8")
-        except: return bytes(v).hex()
-    if isinstance(v, dict): return {str(k): _safe(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple, set)): return [_safe(x) for x in v]
-    return str(v)
-
-def _is_debug(): return bool(getattr(_thread_local, "debug_enabled", False))
-
-def dbg(tag, **fields):
-    if not _is_debug(): return
-    payload = {"ts": datetime.now().isoformat()}
-    payload.update({k: _safe(v) for k, v in fields.items()})
-    try: line = json.dumps(payload, ensure_ascii=False)
-    except: line = str(payload)
-    with _debug_lock:
-        _debug_buffer.append(f"[{tag}] {line}")
-        if len(_debug_buffer) > 200: _debug_buffer.pop(0)
-
-# ========== KONFIG GARENA (UTUH) ==========
-REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt","SG":"en","MY":"ms","PH":"en","US":"en"}
-HEX_KEY = bytes.fromhex("32656534343831396539623435393838343531343130363762323831363231383734643064356437616639643866376530306331653534373135623764316533")
-OPT = {'timeout': 8, 'retries': 2, 'backoff': 0.05}
-RARITY_SCORE_THRESHOLD = 8
-FIXED_WORKERS = 100
-TARGET_ACC_PER_SEC = 50.0
-
-# ========== IP SPOOFER (UTUH) ==========
-class FastIPSpoofer:
-    _IP_POOL, _IP_INDEX, _IP_LOCK = [], 0, threading.Lock()
-    @classmethod
-    def init_ip_pool(cls, count=5000):
-        if not cls._IP_POOL:
-            r = random.randint
-            for _ in range(count): cls._IP_POOL.append(f"{r(1,254)}.{r(0,255)}.{r(0,255)}.{r(1,254)}")
-    @classmethod
-    def get_ip(cls):
-        with cls._IP_LOCK:
-            ip = cls._IP_POOL[cls._IP_INDEX % len(cls._IP_POOL)]
-            cls._IP_INDEX += 1
-            return ip
-FastIPSpoofer.init_ip_pool(5000)
-
-# ========== DEVICE POOL (UTUH) ==========
-class DevicePool:
-    _devices, _index, _lock = [], 0, threading.Lock()
-    DEVICE_MODELS = [
-        ("Asus ASUS_I005DA", "ARMv7 VFPv3 NEON VMH | 2400 | 2", "Adreno (TM) 640"),
-        ("SM-A525F", "ARMv8 VFPv4 NEON VMH | 2200 | 8", "Adreno (TM) 618"),
-        ("SM-A325M", "ARMv8 VFPv4 NEON VMH | 2000 | 8", "Mali-G52"),
-        ("SM-S918B", "ARMv8 VFPv4 NEON VMH | 3200 | 8", "Adreno (TM) 740"),
-        ("Redmi Note 10","ARMv8 VFPv4 NEON VMH | 2200 | 8","Adreno (TM) 619"),
-        ("Redmi Note 11","ARMv8 VFPv4 NEON VMH | 2400 | 8","Adreno (TM) 610"),
-        ("Poco X3","ARMv8 VFPv4 NEON VMH | 2300 | 8","Adreno (TM) 618"),
-        ("Poco M4 Pro","ARMv8 VFPv4 NEON VMH | 2200 | 8","Mali-G57"),
-        ("Pixel 6","ARMv8 VFPv4 NEON VMH | 2800 | 8","Mali-G78"),
-        ("Pixel 7 Pro","ARMv8 VFPv4 NEON VMH | 2800 | 8","Mali-G710"),
-        ("OnePlus 9","ARMv8 VFPv4 NEON VMH | 2800 | 8","Adreno (TM) 660"),
-        ("Infinix X6819","ARMv8 VFPv4 NEON VMH | 2400 | 8","Mali-G57"),
-        ("vivo 1906","ARMv8 VFPv4 NEON VMH | 2000 | 8","Adreno (TM) 610"),
-    ]
-    ANDROID_VERSIONS = [
-        ("Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)","9","28"),
-        ("Android OS 10 / API-29 (QKQ1.200114.002)","10","29"),
-        ("Android OS 11 / API-30 (RP1A.201005.001)","11","30"),
-        ("Android OS 12 / API-31 (SP1A.210812.016)","12","31"),
-        ("Android OS 13 / API-33 (TQ3A.230805.001)","13","33"),
-        ("Android OS 14 / API-34 (UP1A.231005.007)","14","34"),
-    ]
-    NETWORKS = ["WIFI","4G","5G"]
-    OPERATORS = ["ATM Mobils","Telkomsel","Indosat","XL Axiata","Airtel","Jio","Vodafone","Globe","Smart","Viettel","Mobifone","Claro","Vivo"]
-    SDK_VER = ["4.0.38","4.0.39","4.0.40","4.0.41","4.0.42"]
-
-    @classmethod
-    def _rh(cls, n): return ''.join(random.choices("0123456789abcdef", k=n))
-    @classmethod
-    def _uuid(cls): return f"{cls._rh(8)}-{cls._rh(4)}-{cls._rh(4)}-{cls._rh(4)}-{cls._rh(12)}"
-    @classmethod
-    def _mac(cls): return "02:" + ":".join(cls._rh(2) for _ in range(5))
-
-    @classmethod
-    def init_pool(cls, count=2500):
-        if cls._devices: return
-        for _ in range(count):
-            model, cpu, gpu = random.choice(cls.DEVICE_MODELS)
-            android_full, android_ver, api = random.choice(cls.ANDROID_VERSIONS)
-            dev = {
-                "model": model, "brand": model.split()[0], "cpu": cpu, "gpu": gpu,
-                "android_full": android_full, "android_version": android_ver, "api_level": api,
-                "operator": random.choice(cls.OPERATORS), "network": random.choice(cls.NETWORKS),
-                "sdk": random.choice(cls.SDK_VER), "mac": cls._mac(),
-                "device_id": cls._rh(32), "android_id": cls._rh(16), "uuid": cls._uuid(),
-                "imei": cls._rh(15), "fingerprint": cls._rh(40),
-            }
-            dev["_hdr"] = {
-                "X-Device-Id": dev["device_id"], "X-Android-Id": dev["android_id"],
-                "X-Device-Model": dev["model"], "X-Device-Brand": dev["brand"],
-                "X-OS-Version": dev["android_version"], "X-API-Level": dev["api_level"],
-                "X-SDK-Version": dev["sdk"], "X-Network-Type": dev["network"],
-                "X-Operator": dev["operator"], "X-IMEI": dev["imei"],
-                "X-Mac": dev["mac"], "X-Client-Uuid": dev["uuid"],
-            }
-            dev["_gpu_full"] = f"{gpu}|OpenGL ES 3.2"
-            cls._devices.append(dev)
-
-    @classmethod
-    def get(cls):
-        with cls._lock:
-            dev = cls._devices[cls._index % len(cls._devices)]
-            cls._index += 1
-            return dev
-
-    @classmethod
-    def headers(cls, device=None):
-        d = device or cls.get()
-        return d.get("_hdr") or {}
-
-DevicePool.init_pool(2500)
-
-def get_thread_device():
-    if not hasattr(_thread_local, "device"):
-        _thread_local.device = DevicePool.get()
-        _thread_local.dev_headers = _thread_local.device["_hdr"]
-    return _thread_local.device
-
-def get_thread_dev_headers():
-    if not hasattr(_thread_local, "dev_headers"):
-        _thread_local.device = DevicePool.get()
-        _thread_local.dev_headers = _thread_local.device["_hdr"]
-    return _thread_local.dev_headers
-
-def reset_thread_device():
-    _thread_local.device = DevicePool.get()
-    _thread_local.dev_headers = _thread_local.device["_hdr"]
-    s = getattr(_thread_local, "session", None)
-    if s is not None: s.cookies.clear()
-
-def get_thread_session():
-    s = getattr(_thread_local, "session", None)
-    if s is None:
-        s = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0, pool_block=False)
-        s.mount("https://", adapter); s.mount("http://", adapter)
-        _thread_local.session = s
-    return s
-
-def encode_f14(s):
-    ks = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30, 0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37, 0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31, 0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
-    return bytes(ord(c) ^ ks[i % len(ks)] for i, c in enumerate(s))
+_AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
+_AES_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
 FIELD_22 = bytes.fromhex(
     "4747524501010100620200001052aa0d669c6a368f08338060d2ee0690053af84a41edcd3558556ec10f24f4"
@@ -229,440 +81,985 @@ FIELD_22 = bytes.fromhex(
     "0e43"
 )
 
-class WAFBypass:
-    @staticmethod
-    def get_ua():
-        dev = random.choice(DevicePool.DEVICE_MODELS)[0]
-        android_full, ver, api = random.choice(DevicePool.ANDROID_VERSIONS)
-        sdk = random.choice(DevicePool.SDK_VER)
-        lang = random.choice(["en", "id", "ar", "hi", "vi", "th", "pt", "ru", "es", "bn", "ur", "zh"])
-        reg = random.choice(["ID", "SG", "US", "BR", "ME", "IN", "TH", "VN", "PK", "BD", "TW", "CIS"])
-        return f"GarenaMSDK/{sdk}({dev};Android {ver};{lang};{reg};)"
+# ═══════════════════════════════════════════════════════════════════════════
+#  IP POOL — RATUSAN IP (proxy header spoofing)
+# ═══════════════════════════════════════════════════════════════════════════
 
-session = requests.Session()
-_IP_HEADER_KEYS = ("X-Forwarded-For", "X-Real-IP", "X-Client-IP", "CF-Connecting-IP", "True-Client-IP")
+def _build_ip_pool():
+    """Generate ratusan IP publik dari range realistis."""
+    pool = set()
+    ranges = [
+        # (prefix, jumlah) — prefix dari range publik populer
+        ("1.",       400), ("5.",       400), ("14.",      400), ("27.",      400),
+        ("31.",      400), ("36.",      400), ("37.",      400), ("39.",      400),
+        ("41.",      400), ("42.",      400), ("43.",      400), ("45.",      400),
+        ("46.",      400), ("47.",      400), ("49.",      400), ("58.",      400),
+        ("59.",      400), ("60.",      400), ("61.",      400), ("62.",      400),
+        ("77.",      400), ("78.",      400), ("79.",      400), ("80.",      400),
+        ("81.",      400), ("82.",      400), ("83.",      400), ("84.",      400),
+        ("85.",      400), ("86.",      400), ("87.",      400), ("88.",      400),
+        ("89.",      400), ("90.",      400), ("91.",      400), ("92.",      400),
+        ("93.",      400), ("94.",      400), ("95.",      400), ("101.",     400),
+        ("102.",     400), ("103.",     400), ("104.",     400), ("105.",     400),
+        ("106.",     400), ("107.",     400), ("108.",     400), ("109.",     400),
+        ("110.",     400), ("111.",     400), ("112.",     400), ("113.",     400),
+        ("114.",     400), ("115.",     400), ("116.",     400), ("117.",     400),
+        ("118.",     400), ("119.",     400), ("120.",     400), ("121.",     400),
+        ("122.",     400), ("123.",     400), ("124.",     400), ("125.",     400),
+        ("126.",     400), ("128.",     400), ("129.",     400), ("130.",     400),
+        ("131.",     400), ("132.",     400), ("133.",     400), ("134.",     400),
+        ("135.",     400), ("136.",     400), ("137.",     400), ("138.",     400),
+        ("139.",     400), ("140.",     400), ("141.",     400), ("142.",     400),
+        ("143.",     400), ("144.",     400), ("145.",     400), ("146.",     400),
+        ("147.",     400), ("148.",     400), ("149.",     400), ("150.",     400),
+        ("151.",     400), ("152.",     400), ("153.",     400), ("154.",     400),
+        ("155.",     400), ("156.",     400), ("157.",     400), ("158.",     400),
+        ("159.",     400), ("160.",     400), ("161.",     400), ("162.",     400),
+        ("163.",     400), ("164.",     400), ("165.",     400), ("166.",     400),
+        ("167.",     400), ("168.",     400), ("169.",     400), ("170.",     400),
+        ("171.",     400), ("172.",     400), ("173.",     400), ("174.",     400),
+        ("175.",     400), ("176.",     400), ("177.",     400), ("178.",     400),
+        ("179.",     400), ("180.",     400), ("181.",     400), ("182.",     400),
+        ("183.",     400), ("184.",     400), ("185.",     400), ("186.",     400),
+        ("187.",     400), ("188.",     400), ("189.",     400), ("190.",     400),
+        ("191.",     400), ("192.",     400), ("193.",     400), ("194.",     400),
+        ("195.",     400), ("196.",     400), ("197.",     400), ("198.",     400),
+        ("199.",     400), ("200.",     400), ("201.",     400), ("202.",     400),
+        ("203.",     400), ("204.",     400), ("205.",     400), ("206.",     400),
+        ("207.",     400), ("208.",     400), ("209.",     400), ("210.",     400),
+        ("211.",     400), ("212.",     400), ("213.",     400), ("214.",     400),
+        ("215.",     400), ("216.",     400), ("217.",     400), ("218.",     400),
+        ("219.",     400), ("220.",     400), ("221.",     400), ("222.",     400),
+        ("223.",     400),
+    ]
 
-def _merge_headers(headers, device=None, rotate_ip=False):
-    if headers is None: headers = {}
-    merged = dict(headers)
-    dev_h = DevicePool.headers(device) if device is not None else get_thread_dev_headers()
-    for k, v in dev_h.items(): merged.setdefault(k, v)
-    if rotate_ip or "X-Forwarded-For" not in merged:
-        ip = FastIPSpoofer.get_ip()
-        for k in _IP_HEADER_KEYS: merged[k] = ip
-        merged["Forwarded"] = f"for={ip}"
-    return merged
+    private_ranges = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+        ipaddress.ip_network("224.0.0.0/4"),
+        ipaddress.ip_network("240.0.0.0/4"),
+    ]
 
-def request_retry(method, url, tag="HTTP", **kwargs):
-    sess = get_thread_session()
-    for attempt in range(OPT['retries'] + 1):
-        try:
-            kwargs.setdefault('timeout', OPT['timeout'])
-            kwargs['headers'] = _merge_headers(kwargs.get('headers'), rotate_ip=(attempt > 0))
-            kwargs['verify'] = False
-            resp = sess.request(method, url, **kwargs)
-            if resp.status_code in (429, 500, 502, 503, 504, 408, 403):
-                if attempt < OPT['retries']:
-                    reset_thread_device(); sess = get_thread_session(); continue
-            return resp
-        except Exception:
-            if attempt < OPT['retries']:
-                reset_thread_device(); sess = get_thread_session(); continue
-            return None
-    return None
+    for prefix, count in ranges:
+        for _ in range(count):
+            b = random.randint(0, 255)
+            c = random.randint(0, 255)
+            d = random.randint(1, 254)
+            ip_str = f"{prefix}{b}.{c}.{d}"
+            try:
+                ip_obj = ipaddress.ip_address(ip_str)
+                if any(ip_obj in net for net in private_ranges):
+                    continue
+                pool.add(ip_str)
+            except Exception:
+                continue
+
+    pool_list = list(pool)
+    random.shuffle(pool_list)
+    return pool_list
+
+
+print("[*] Building IP pool...")
+IP_POOL = _build_ip_pool()
+print(f"[+] IP pool ready: {len(IP_POOL)} IPs")
+
+_ip_idx = 0
+_ip_lock = threading.Lock()
+
+
+def pick_ip():
+    """Round-robin random dari IP pool besar."""
+    global _ip_idx
+    if not IP_POOL:
+        return None
+    with _ip_lock:
+        i = random.randint(0, len(IP_POOL) - 1)
+        return IP_POOL[i]
+
+
+def ip_headers():
+    """Generate header spoof IP + chain fake."""
+    real = pick_ip() or f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+    chain = [real]
+    for _ in range(random.randint(1, 3)):
+        chain.append(pick_ip() or real)
+    forwarded_for = ", ".join(chain)
+    return {
+        "X-Forwarded-For": forwarded_for,
+        "X-Real-IP": real,
+        "X-Client-IP": real,
+        "X-Originating-IP": real,
+        "X-Remote-IP": real,
+        "X-Remote-Addr": real,
+        "Forwarded": f"for={real};proto=https",
+        "CF-Connecting-IP": real,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DEVICE POOL — 200+ UA
+# ═══════════════════════════════════════════════════════════════════════════
+
+USER_AGENTS_POOL = [
+    # === Existing (dari kodemu) ===
+    "GarenaMSDK/4.0.39(SM-A325M;Android 13;en;HK;)",
+    "GarenaMSDK/4.0.38(Redmi Note 10;Android 12;en;ID;)",
+    "GarenaMSDK/4.0.40(Poco X3;Android 11;en;SG;)",
+    "GarenaMSDK/4.0.41(SM-S918B;Android 14;en;IN;)",
+    "GarenaMSDK/4.0.42(OnePlus 11;Android 13;en;US;)",
+    "GarenaMSDK/4.0.39(Xiaomi 13 Pro;Android 13;pt;BR;)",
+    "GarenaMSDK/4.0.40(Pixel 7 Pro;Android 14;en;US;)",
+    "GarenaMSDK/4.0.38(ASUS ROG Phone 7;Android 13;id;ID;)",
+    "GarenaMSDK/4.0.41(Infinix Note 12;Android 12;th;TH;)",
+    "GarenaMSDK/4.0.43(SM-G998B;Android 13;ar;EG;)",
+    "GarenaMSDK/4.0.37(Redmi Note 11;Android 11;es;MX;)",
+    "GarenaMSDK/4.0.40(Poco F5;Android 13;en;VN;)",
+    "GarenaMSDK/4.0.42(Realme GT 3;Android 13;hi;IN;)",
+    "GarenaMSDK/4.0.39(Vivo V27;Android 13;en;PH;)",
+    "GarenaMSDK/4.0.41(OPPO Reno 10;Android 13;id;ID;)",
+    "GarenaMSDK/4.0.38(Tecno Camon 20;Android 13;fr;FR;)",
+    "GarenaMSDK/4.0.40(Huawei P50;Android 11;ar;SA;)",
+    "GarenaMSDK/4.0.42(Lenovo Legion Y70;Android 12;zh;TW;)",
+    "GarenaMSDK/4.0.39(Zuck Z5 Pro;Android 11;en;US;)",
+    "GarenaMSDK/4.0.44(SM-S928B;Android 14;en;SG;)",
+    "GarenaMSDK/4.0.42(Xiaomi 14;Android 14;id;ID;)",
+    "GarenaMSDK/4.0.40(Poco X5 Pro;Android 12;en;MY;)",
+    "GarenaMSDK/4.0.41(Oppo Find X5;Android 13;th;TH;)",
+    "GarenaMSDK/4.0.39(Vivo X80;Android 12;vi;VN;)",
+    "GarenaMSDK/4.0.43(Realme 11 Pro;Android 13;hi;IN;)",
+    "GarenaMSDK/4.0.38(Infinix Zero 30;Android 13;ar;SA;)",
+    "GarenaMSDK/4.0.40(Tecno Phantom V;Android 13;pt;BR;)",
+    "GarenaMSDK/4.0.42(Samsung A54;Android 13;es;MX;)",
+    "GarenaMSDK/4.0.39(Samsung A34;Android 13;en;PH;)",
+]
+
+# === Samsung A-series & S-series (7 region × 15 model) ===
+_SAMSUNG_MODELS = [
+    ("SM-A325M", "13"), ("SM-A525F", "13"), ("SM-A725F", "13"),
+    ("SM-A127F", "12"), ("SM-A037F", "11"), ("SM-A546E", "14"),
+    ("SM-A346E", "14"), ("SM-A146P", "13"), ("SM-M236B", "13"),
+    ("SM-M536B", "14"),
+    ("SM-S901E", "13"), ("SM-S908E", "13"), ("SM-S918B", "14"),
+    ("SM-G998B", "13"), ("SM-G991B", "13"), ("SM-A135F", "13"),
+    ("SM-A226B", "13"), ("SM-A536B", "14"), ("SM-M135F", "13"),
+    ("SM-A045F", "13"),
+]
+_SAMSUNG_REGS = ["HK", "ID", "SG", "MY", "PH", "TH", "VN"]
+
+for _model, _osv in _SAMSUNG_MODELS:
+    for _reg in _SAMSUNG_REGS:
+        USER_AGENTS_POOL.append(
+            f"GarenaMSDK/4.0.39({_model};Android {_osv};en;{_reg};)"
+        )
+
+# === Xiaomi / Poco / Redmi (7 region × 20 model) ===
+_XIAOMI_MODELS = [
+    "Poco X3", "Poco X3 Pro", "Poco F3", "Poco F4", "Poco F5",
+    "Poco M4 Pro", "Poco M5",
+    "Xiaomi 12", "Xiaomi 12 Pro", "Xiaomi 13 Pro", "Xiaomi 14", "Xiaomi 14 Pro",
+    "Xiaomi 11T", "Xiaomi 11T Pro",
+    "Redmi Note 10", "Redmi Note 11", "Redmi Note 12", "Redmi Note 13",
+    "Redmi 9", "Redmi 10", "Redmi 12",
+]
+_XIAOMI_OS = ["11", "12", "13", "14"]
+
+for _model in _XIAOMI_MODELS:
+    for _osv in _XIAOMI_OS:
+        for _reg in _SAMSUNG_REGS:
+            USER_AGENTS_POOL.append(
+                f"GarenaMSDK/4.0.40({_model};Android {_osv};en;{_reg};)"
+            )
+
+# === Oppo (CPH series) ===
+_OPPO_MODELS = [
+    "CPH2025", "CPH2219", "CPH2345", "CPH2449",
+    "CPH2557", "CPH2509", "CPH2601",
+]
+for _model in _OPPO_MODELS:
+    for _osv in ["12", "13", "14"]:
+        for _reg in _SAMSUNG_REGS:
+            USER_AGENTS_POOL.append(
+                f"GarenaMSDK/4.0.39({_model};Android {_osv};en;{_reg};)"
+            )
+
+# === Vivo (V-series) ===
+_VIVO_MODELS = [
+    "V2024", "V2048", "V2120", "V2146", "V2229", "V2307",
+]
+for _model in _VIVO_MODELS:
+    for _osv in ["12", "13", "14"]:
+        for _reg in _SAMSUNG_REGS:
+            USER_AGENTS_POOL.append(
+                f"GarenaMSDK/4.0.39({_model};Android {_osv};en;{_reg};)"
+            )
+
+# === Realme (RMX series) ===
+_REALME_MODELS = [
+    "RMX2020", "RMX3360", "RMX3363", "RMX3630", "RMX3700",
+    "RMX3686", "RMX3636", "RMX3624",
+]
+for _model in _REALME_MODELS:
+    for _osv in ["11", "12", "13", "14"]:
+        for _reg in _SAMSUNG_REGS:
+            USER_AGENTS_POOL.append(
+                f"GarenaMSDK/4.0.39({_model};Android {_osv};en;{_reg};)"
+            )
+
+# === OnePlus ===
+_ONEPLUS_MODELS = ["CPH2411", "CPH2451", "CPH2477", "CPH2487", "CPH2493"]
+for _model in _ONEPLUS_MODELS:
+    for _osv in ["13", "14"]:
+        for _reg in _SAMSUNG_REGS:
+            USER_AGENTS_POOL.append(
+                f"GarenaMSDK/4.0.39({_model};Android {_osv};en;{_reg};)"
+            )
+
+# Dedup
+USER_AGENTS_POOL = list(dict.fromkeys(USER_AGENTS_POOL))
+
+print(f"[+] UA pool ready: {len(USER_AGENTS_POOL)} UAs")
+
+# ═══ TAHAP 1 PATCH — START AUTO CLEANUP THREAD ═══
+if _CLEANUP_OK:
+    start_cleanup_thread()
+# ═══ END TAHAP 1 PATCH ═══
+
+
+def random_ua():
+    return random.choice(USER_AGENTS_POOL)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DEVICE INFO BUILDER (untuk MajorLogin proto field)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DEVICE_MODELS = [
+    ("Asus ASUS_AI2501_B", "Android OS 12 / API-31 (SP1A.210812.016.C2)", "Adreno (TM) 640"),
+    ("Redmi Note 12 Pro", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 618"),
+    ("Samsung SM-M135F", "Android OS 13 / API-33 (TP1A.220624.014)", "Mali-G68"),
+    ("Realme RMX3630", "Android OS 12 / API-31 (SP1A.210812.016)", "Adreno (TM) 610"),
+    ("Vivo V2149", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 642L"),
+    ("OnePlus CPH2411", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 730"),
+    ("Poco M4 Pro 5G", "Android OS 12 / API-31 (SP1A.210812.016)", "Mali-G57 MC2"),
+    ("iQOO I2012", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 650"),
+    ("Oppo CPH2477", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 619"),
+    ("Tecno KI8", "Android OS 13 / API-33 (TP1A.220624.014)", "Mali-G57"),
+    ("Infinix X6819", "Android OS 12 / API-31 (SP1A.210812.016)", "Mali-G52 MC2"),
+    ("Motorola moto g73", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 619"),
+    ("Xiaomi 2201122G", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 730"),
+    ("Realme RMX3700", "Android OS 14 / API-34 (UP1A.231005.007)", "Mali-G710"),
+    ("OnePlus CPH2451", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 740"),
+    ("OPPO CPH2611", "Android OS 14 / API-34 (UP1A.231005.007)", "Adreno (TM) 720"),
+    ("Samsung SM-G998B", "Android OS 12 / API-31 (SP1A.210812.016)", "Adreno (TM) 660"),
+    ("Poco M2102J20SG", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 660"),
+    ("Vivo V2203", "Android OS 12 / API-31 (SP1A.210812.016)", "Mali-G710"),
+    ("Xiaomi 2201117TG", "Android OS 12 / API-31 (SP1A.210812.016)", "Adreno (TM) 618"),
+    ("Samsung SM-A546E", "Android OS 14 / API-34 (UP1A.231005.007)", "Mali-G68"),
+    ("Xiaomi 23127PN0CG", "Android OS 14 / API-34 (UP1A.231005.007)", "Adreno (TM) 750"),
+    ("Poco F5 Pro", "Android OS 13 / API-33 (TP1A.220624.014)", "Adreno (TM) 730"),
+    ("Vivo V2307", "Android OS 14 / API-34 (UP1A.231005.007)", "Mali-G610"),
+    ("Oppo CPH2557", "Android OS 14 / API-34 (UP1A.231005.007)", "Adreno (TM) 710"),
+]
+
+
+def generate_device_info():
+    model, os_str, gpu = random.choice(DEVICE_MODELS)
+    return {
+        "model": model,
+        "os_string": os_str,
+        "gpu": gpu,
+        "gpu_full": "OpenGL ES 3.2",
+        "device_id": f"Google|{uuid.uuid4()}",
+        "device_uuid": f"02-{uuid.uuid4()}",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  THREAD-LOCAL SESSION (non stuck)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_thread_local = threading.local()
+
+
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=200,
+            pool_maxsize=200,
+            max_retries=0,
+            pool_block=False,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.verify = False
+        s.headers.update({
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+        })
+        _thread_local.session = s
+    return _thread_local.session
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STATS
+# ═══════════════════════════════════════════════════════════════════════════
+
+STATS = {
+    "total_requests": 0,
+    "total_success": 0,
+    "total_fail": 0,
+    "fail_register": 0,
+    "fail_token": 0,
+    "fail_major": 0,
+    "last_success_at": None,
+    "last_fail_at": None,
+}
+STATS_LOCK = threading.Lock()
+
+
+def record_success():
+    with STATS_LOCK:
+        STATS["total_requests"] += 1
+        STATS["total_success"] += 1
+        STATS["last_success_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def record_fail(kind="major"):
+    with STATS_LOCK:
+        STATS["total_requests"] += 1
+        STATS["total_fail"] += 1
+        STATS["last_fail_at"] = datetime.now(timezone.utc).isoformat()
+        if kind == "reg":
+            STATS["fail_register"] += 1
+        elif kind == "tok":
+            STATS["fail_token"] += 1
+        elif kind == "major":
+            STATS["fail_major"] += 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_random_name(base):
+    chars = string.ascii_letters + string.digits
+    return f"{base[:4]}{''.join(random.choice(chars) for _ in range(8))}"
+
 
 def encode_varint(n):
-    if n < 0: return b''
-    result = []
+    if n < 0:
+        return b""
+    out = bytearray()
     while True:
-        byte = n & 0x7F; n >>= 7
-        if n: byte |= 0x80
-        result.append(byte)
-        if not n: break
-    return bytes(result)
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            break
+    return bytes(out)
+
 
 def create_proto_field(field_num, value):
-    if isinstance(value, dict):
-        nested = create_proto_field(field_num, value)
-        return encode_varint((field_num << 3) | 2) + encode_varint(len(nested)) + nested
-    elif isinstance(value, int):
-        return encode_varint((field_num << 3) | 0) + encode_varint(value)
-    elif isinstance(value, (str, bytes)):
-        ev = value.encode() if isinstance(value, str) else value
-        return encode_varint((field_num << 3) | 2) + encode_varint(len(ev)) + ev
-    return b''
+    try:
+        if isinstance(value, int):
+            return encode_varint((field_num << 3) | 0) + encode_varint(value)
+        elif isinstance(value, (str, bytes)):
+            v = value.encode() if isinstance(value, str) else value
+            return encode_varint((field_num << 3) | 2) + encode_varint(len(v)) + v
+        elif isinstance(value, dict):
+            nested = build_proto(value)
+            return encode_varint((field_num << 3) | 2) + encode_varint(len(nested)) + nested
+        return b""
+    except Exception:
+        return b""
+
 
 def build_proto(fields):
-    return b''.join(create_proto_field(k, v) for k, v in fields.items())
+    try:
+        return b"".join(create_proto_field(k, v) for k, v in fields.items())
+    except Exception:
+        return b""
 
-_AES_KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
-_AES_IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 
 def aes_encrypt(hex_data):
-    data = bytes.fromhex(hex_data)
-    return AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).encrypt(pad(data, AES.block_size))
+    try:
+        data = bytes.fromhex(hex_data)
+        return AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).encrypt(pad(data, AES.block_size))
+    except Exception:
+        return b""
+
 
 def encrypt_api(plain_hex):
-    plain = bytes.fromhex(plain_hex)
-    return AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).encrypt(pad(plain, AES.block_size)).hex()
-
-def create_account(region, account_name, password_prefix):
     try:
-        rand_part = "".join(random.choices("0123456789ABCDEF", k=16))
-        password = f"{password_prefix}_{rand_part}"
-        url = "https://100067.connect.garena.com/api/v2/oauth:register"
-        payload = {"app_id": 100067, "client_type": 2, "password": password, "source": 2}
-        body_json = json.dumps(payload, separators=(",", ":"))
-        signature = hmac.new(HEX_KEY, body_json.encode("utf-8"), hashlib.sha256).hexdigest()
+        plain = bytes.fromhex(plain_hex)
+        return AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV).encrypt(pad(plain, AES.block_size)).hex()
+    except Exception:
+        return ""
 
-        dbg("Register.request", url=url, body=body_json, signature=signature)
-        dev = get_thread_device()
-        headers = _merge_headers({
-            "User-Agent": WAFBypass.get_ua(),
-            "Connection": "Keep-Alive", "Accept": "application/json", "Accept-Encoding": "gzip",
-            "Authorization": f"Signature {signature}", "Content-Type": "application/json; charset=utf-8",
+
+def _make_field_f14(open_id):
+    keystream = [
+        0x30, 0x30, 0x30, 0x32, 0x30, 0x31, 0x37, 0x30,
+        0x30, 0x30, 0x30, 0x30, 0x32, 0x30, 0x31, 0x37,
+        0x30, 0x30, 0x30, 0x30, 0x30, 0x32, 0x30, 0x31,
+        0x37, 0x30, 0x30, 0x30, 0x30, 0x30, 0x32, 0x30,
+    ]
+    ob = open_id.encode("latin1", errors="ignore") if isinstance(open_id, str) else open_id
+    return bytes((ob[i] ^ keystream[i % len(keystream)]) & 0xFF for i in range(len(ob)))
+
+
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
+
+
+def extract_jwt(content: bytes):
+    if not content:
+        return None
+    try:
+        text = content.decode("utf-8", errors="ignore")
+        m = JWT_RE.search(text)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+    try:
+        m = re.search(rb"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", content)
+        if m:
+            return m.group(0).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return None
+
+
+def is_valid_jwt(tok):
+    return bool(tok) and tok.startswith("eyJ") and tok.count(".") >= 2 and len(tok) > 50
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GARENA API CALLS — NON STUCK, NO SLEEP
+# ═══════════════════════════════════════════════════════════════════════════
+
+def guest_register(password):
+    try:
+        body = json.dumps({
+            "app_id": APP_ID,
+            "client_type": 2,
+            "password": password,
+            "source": 2,
+        }, separators=(",", ":"))
+        sig = hmac.new(HEX_KEY.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+        ua = random_ua()
+        headers = {
+            "User-Agent": ua,
+            "Connection": "Keep-Alive",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "Authorization": f"Signature {sig}",
+            "Content-Type": "application/json; charset=utf-8",
             "Host": "100067.connect.garena.com",
-        }, device=dev)
-
-        resp = request_retry('POST', url, tag="Register", headers=headers, data=body_json)
-        if resp and resp.status_code == 200:
-            res = resp.json()
-            if "data" in res and "uid" in res["data"]:
-                uid = res["data"]["uid"]
-                dbg("Register.success", uid=uid)
-                return get_token(str(uid), password, region, account_name, password_prefix)
-        
-        dbg("Register.fail", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
-        return None
-    except Exception as e:
-        dbg("Register.error", raw=str(e))
-        return None
-
-def get_token(uid, password, region, account_name, password_prefix):
-    try:
-        url = "https://100067.connect.garena.com/oauth/guest/token/grant"
-        dev = get_thread_device()
-        headers = _merge_headers({"Content-Type": "application/x-www-form-urlencoded", "User-Agent": WAFBypass.get_ua()}, device=dev)
-        body = {"uid": uid, "password": password, "response_type": "token", "client_type": "2", "client_secret": HEX_KEY, "client_id": "100067"}
-
-        resp = request_retry('POST', url, tag="Token", headers=headers, data=body)
-        if resp and resp.status_code == 200 and 'open_id' in resp.json():
-            j = resp.json()
-            open_id = j['open_id']; access_token = j["access_token"]
-            dbg("Token.success", open_id=open_id)
-            
-            keystream = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
-            encoded = "".join(chr(ord(open_id[i]) ^ keystream[i % len(keystream)]) for i in range(len(open_id)))
-            field = codecs.decode(''.join(c if 32 <= ord(c) <= 126 else f'\\u{ord(c):04x}' for c in encoded), 'unicode_escape').encode('latin1')
-            
-            return major_register(access_token, open_id, field, uid, password, region, account_name, password_prefix)
-        
-        dbg("Token.fail", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
-        return None
-    except Exception as e:
-        dbg("Token.error", raw=str(e))
-        return None
-
-def major_register(access_token, open_id, field, uid, password, region, account_name, password_prefix):
-    try:
-        url = "https://loginbp.ppmainecoonghj.com/MajorRegister" if region.upper() not in ["ME","TH"] else "https://loginbp.common.ggbluefox.com/MajorRegister"
-        name = generate_random_name(account_name)
-        dev = get_thread_device()
-        headers = _merge_headers({
-            'Host': 'loginbp.ppmainecoonghj.com', 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
-            'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
-            'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
-        }, device=dev)
-        lang = REGION_LANG.get(region.upper(), "en")
-        reg_msg = {1: name, 2: access_token, 3: open_id, 5: 102000007, 6: 4, 7: 1, 13: 1, 14: encode_f14(open_id), 15: lang, 16: 2, 20: "2.132.4", 21: 1, 22: FIELD_22}
-        payload_bytes = build_proto(reg_msg)
-        encrypted = aes_encrypt(payload_bytes.hex())
-
-        resp = request_retry('POST', url, tag="MajorRegister", headers=headers, data=encrypted)
-        dbg("MajorRegister.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
-        
-        login_result = major_login(uid, password, access_token, open_id, region)
-        account_id = login_result.get("account_id", "N/A")
-        jwt_token  = login_result.get("jwt_token", "")
-        
-        if account_id != "N/A":
-            if jwt_token and region.upper() != "BR":
-                try: force_region_bind(region, jwt_token)
-                except: pass
-            return {"uid": uid, "password": password, "name": name, "region": region, "account_id": account_id, "jwt_token": jwt_token, "device_model": dev["model"], "device_id": dev["device_id"], "created_at": datetime.now().isoformat()}
-        return None
-    except Exception as e:
-        dbg("MajorRegister.error", raw=str(e))
-        return None
-
-def major_login(uid, password, access_token, open_id, region):
-    try:
-        lang = REGION_LANG.get(region.upper(), "en")
-        dev  = get_thread_device()
-        gpu_full, gpu, model, os_str, operator, network, device_uuid, cpu = dev["_gpu_full"], dev["gpu"], dev["model"], dev["android_full"], dev["operator"], dev["network"], dev["uuid"], dev["cpu"]
-        ip_addr = FastIPSpoofer.get_ip()
-
-        open_id_b = open_id.encode() if isinstance(open_id, str) else open_id
-        access_token_b = access_token.encode() if isinstance(access_token, str) else access_token
-
-        payload_dict = {
-            3: datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), 4: b'free fire', 5: 1, 7: "2.132.4", 8: os_str, 9: b'Handheld',
-            10: operator, 11: network, 12: 1280, 13: 720, 14: b'240', 15: cpu, 16: random.choice([5951, 6000, 6100, 5500]),
-            17: gpu, 18: gpu_full, 19: f'Google|{device_uuid}', 20: ip_addr, 21: lang, 22: open_id_b, 23: b'4', 24: b'Handheld',
-            25: model, 26: lang, 29: access_token_b, 30: 1, 41: operator, 42: network, 57: b'1ac4b80ecf0478a44203bf8fac6120f5',
-            60: 30000, 61: 30000, 62: 2519, 63: 243, 64: 32357, 65: 34308, 66: 32357, 67: 34308, 73: 1,
-            74: b'/data/app/~~iw-K-GR3srU7dLE-UxJ4bg==/com.dts.freefiremax-kbPhw3SUYautW0I_oayB_A==/lib/arm', 76: 2,
-            77: b'428775ab8c8845bd341b5357ec61d15e|/data/app/~~iw-K-GR3srU7dLE-UxJ4bg==/com.dts.freefiremax-kbPhw3SUYautW0I_oayB_A==/base.apk', 78: 2, 79: 1,
-            81: b'32', 83: b'2019118525', 85: 3, 86: b'OpenGLES3', 87: 4095, 88: 4, 92: random.choice([19788, 20000, 21000]),
-            93: b'android_max', 94: b'KqsHT2gyPt7vUCc9SCjv2ioi3WEZSEL86ErvXB38suVVK/Z4IVt78ESl/r2S15C1pqu/j6ZmgFL7HbwoFiiVconX08ooKiisQffvEAPCo/C+Lahr',
-            96: b'{"cur_rate":null,"support_etc2":true}', 97: 1, 98: 1, 99: b'4', 100: b'4', 102: b'', 104: 77149, 105: 1,
-            106: b'https://dl.cdn.freefiremobile.com/live/ABHotUpdates/|https://dl-core.cdn.freefiremobile.com/live/ABHotUpdates/|6b2078db9d22dd98f8e9386a39af8462',
-            107: b'c8e41b7a93f02d56e1a94c7b8203f5d1',
         }
-        data = build_proto(payload_dict)
-        url = "https://loginbp.ppmainecoonghj.com/MajorLogin" if region.upper() not in ["ME", "TH"] else "https://loginbp.common.ggbluefox.com/MajorLogin"
-        headers = _merge_headers({
-            'Host': 'loginbp.ppmainecoonghj.com', 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
-            'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
-            'X-Ga-Sv': '1789534056', 'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
-        }, device=dev)
-        enc_hex = encrypt_api(data.hex())
+        headers.update(ip_headers())
 
-        resp = request_retry('POST', url, tag="MajorLogin", headers=headers, data=bytes.fromhex(enc_hex))
-        dbg("MajorLogin.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
+        r = get_session().post(
+            URL_GUEST_REGISTER,
+            headers=headers,
+            data=body,
+            timeout=(3, 6),
+            verify=False,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if j.get("code") != 0:
+            return None
+        return j["data"]["uid"]
+    except Exception:
+        return None
 
-        if resp and resp.status_code == 200 and len(resp.text) > 10:
-            jwt_start = resp.text.find("eyJ")
-            if jwt_start != -1:
-                jwt_token = resp.text[jwt_start:]
-                second_dot = jwt_token.find(".", jwt_token.find(".") + 1)
-                if second_dot != -1:
-                    jwt_token = jwt_token[:second_dot + 44]
-                    try:
-                        parts = jwt_token.split('.')
-                        if len(parts) >= 2:
-                            pp = parts[1]; padding = 4 - len(pp) % 4
-                            if padding != 4: pp += '=' * padding
-                            claims = json.loads(base64.urlsafe_b64decode(pp))
-                            account_id = claims.get('account_id') or claims.get('external_id')
-                            if account_id: return {"account_id": str(account_id), "jwt_token": jwt_token}
-                    except: pass
-        return {"account_id": "N/A", "jwt_token": ""}
-    except Exception as e:
-        dbg("MajorLogin.error", raw=str(e))
-        return {"account_id": "N/A", "jwt_token": ""}
+
+def token_grant(uid, password):
+    try:
+        body = json.dumps({
+            "client_id": APP_ID,
+            "client_secret": HEX_KEY,
+            "client_type": 2,
+            "device_id": f"02-{uuid.uuid4()}",
+            "password": password,
+            "response_type": "token",
+            "uid": uid,
+        }, separators=(",", ":"))
+
+        ua = random_ua()
+        headers = {
+            "User-Agent": ua,
+            "Connection": "Keep-Alive",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "Content-Type": "application/json; charset=utf-8",
+            "Host": "100067.connect.garena.com",
+        }
+        headers.update(ip_headers())
+
+        r = get_session().post(
+            URL_TOKEN_GRANT,
+            headers=headers,
+            data=body,
+            timeout=(3, 6),
+            verify=False,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if j.get("code") != 0:
+            return None
+        return j["data"]["access_token"], j["data"]["open_id"]
+    except Exception:
+        return None
+
+
+def build_majorlogin_proto(open_id, access_token, lang="en",
+                           client_version="1.132.1",
+                           client_version_code="2019116753"):
+    device = generate_device_info()
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    fields = {
+        3: now_ts,
+        4: "free fire",
+        5: 4,
+        7: client_version,
+        8: client_version_code,
+        9: device["os_string"],
+        10: "Handheld",
+        11: device["model"],
+        12: 1280,
+        13: 720,
+        14: "240",
+        15: "x86-64 SSE3 SSE4.1 SSE4.2 AVX AVX2 | 2400 | 4",
+        16: random.choice([5951, 6000, 6100, 5500, 6500]),
+        17: device["gpu"],
+        18: "OpenGL ES 3.1 v1.46",
+        19: device["device_id"],
+        20: "127.0.0.1",
+        21: lang,
+        22: open_id,
+        23: "4",
+        24: "Handheld",
+        25: device["model"],
+        26: "IND",
+        29: access_token,
+        30: 1,
+        41: "Jio",
+        42: "WIFI",
+        92: random.choice([19788, 20000, 21000]),
+        93: "android_max",
+        97: 1,
+        98: 1,
+        99: "4",
+        100: "4",
+        104: 77149,
+        105: 1,
+    }
+    proto = build_proto(fields)
+    return bytes.fromhex(encrypt_api(proto.hex()))
+
+
+def major_register(access_token, open_id, uid, password, region, nick, lang):
+    try:
+        field_f14 = _make_field_f14(open_id)
+        payload = {
+            1: nick,
+            2: access_token,
+            3: open_id,
+            5: 102000007,
+            6: 4,
+            7: 1,
+            13: 1,
+            14: field_f14,
+            15: lang,
+            16: 1,
+            17: 1,
+            22: FIELD_22,
+        }
+        enc = aes_encrypt(build_proto(payload).hex())
+
+        ua = random_ua()
+        headers = {
+            "User-Agent": ua,
+            "Accept-Encoding": "deflate, gzip",
+            "X-GA-SV": "1789535859",
+            "Authorization": "Bearer",
+            "X-GA": "v1 1",
+            "ReleaseVersion": RELEASE_VER,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2018.4.12f1",
+            "Host": "loginbp.ppmainecoonghj.com",
+        }
+        headers.update(ip_headers())
+
+        get_session().post(
+            URL_MAJOR_REGISTER,
+            headers=headers,
+            data=enc,
+            verify=False,
+            timeout=(3, 6),
+        )
+        return major_login(access_token, open_id, lang)
+    except Exception:
+        return None
+
+
+def major_login(access_token, open_id, lang="en"):
+    try:
+        payload = build_majorlogin_proto(open_id, access_token, lang)
+
+        ua = random_ua()
+        headers = {
+            "User-Agent": ua,
+            "Accept-Encoding": "deflate, gzip",
+            "X-GA-SV": "1789535859",
+            "Authorization": f"Bearer {access_token}",
+            "X-GA": "v1 1",
+            "ReleaseVersion": RELEASE_VER,
+            "Content-Type": "application/octet-stream",
+            "X-Unity-Version": "2018.4.12f1",
+            "Host": "loginbp.ppmainecoonghj.com",
+        }
+        headers.update(ip_headers())
+
+        r = get_session().post(
+            URL_MAJOR_LOGIN,
+            headers=headers,
+            data=payload,
+            verify=False,
+            timeout=(3, 6),
+        )
+        if r.status_code != 200 or not r.content or len(r.content) < 20:
+            return None
+
+        body = r.content
+        jwt = extract_jwt(body)
+        account_id = None
+
+        if jwt and is_valid_jwt(jwt):
+            try:
+                p = jwt.split(".")[1]
+                p += "=" * (4 - len(p) % 4)
+                dec = json.loads(base64.urlsafe_b64decode(p))
+                account_id = dec.get("account_id") or dec.get("external_id") or dec.get("uid")
+            except Exception:
+                pass
+
+        if not account_id:
+            txt = body.decode("utf-8", errors="ignore")
+            nums = re.findall(r"\b\d{10,12}\b", txt)
+            if nums:
+                account_id = nums[0]
+
+        if account_id:
+            return {"account_id": str(account_id), "jwt_token": jwt or ""}
+        return None
+    except Exception:
+        return None
+
 
 def force_region_bind(region, jwt_token):
     try:
-        url = "https://loginbp.common.ggbluefox.com/ChooseRegion" if region.upper() in ["ME","TH"] else "https://loginbp.ppmainecoonghj.com/ChooseRegion"
-        region_code = "RU" if region.upper() == "CIS" else region.upper()
-        proto_data = build_proto({1: region_code})
-        encrypted = encrypt_api(proto_data.hex())
-        dev = get_thread_device()
-        headers = _merge_headers({
+        rc = "RU" if region.upper() == "CIS" else region.upper()
+        payload = bytes.fromhex(encrypt_api(build_proto({1: rc}).hex()))
+        headers = {
             "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-            "Accept": "*/*", "Accept-Encoding": "deflate, gzip", "X-Ga-Sv": "1789534056",
-            "Authorization": f"Bearer {jwt_token}", "X-Ga": "v1 1", "Releaseversion": "OB55",
-            "Content-Type": "application/x-www-form-urlencoded", "X-Unity-Version": "2018.4.12f1"
-        }, device=dev)
-        request_retry('POST', url, tag="ForceRegionBind", data=bytes.fromhex(encrypted), headers=headers)
-    except: pass
+            "Accept-Encoding": "deflate, gzip",
+            "X-GA-SV": "1789535859",
+            "Authorization": f"Bearer {jwt_token}",
+            "X-GA": "v1 1",
+            "ReleaseVersion": RELEASE_VER,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Unity-Version": "2018.4.12f1",
+        }
+        headers.update(ip_headers())
 
-def generate_random_name(name_prefix): return name_prefix + ''.join(random.choices(string.ascii_letters + string.digits, k=6)).upper()
+        get_session().post(
+            URL_NEWBIE_CHOICE,
+            data=payload,
+            headers=headers,
+            timeout=(3, 6),
+            verify=False,
+        )
+    except Exception:
+        pass
 
-def check_rarity(account_data):
-    account_id = account_data.get("account_id", "")
-    if not account_id or account_id == "N/A": return False, None, None, 0
-    score = 0; patterns_found = []
-    digits = [int(d) for d in account_id if d.isdigit()]
-    if len(set(digits)) == 1 and len(digits) >= 4: score += min(len(digits)*2, 12); patterns_found.append("UNIFORM")
-    if len(account_id) <= 8 and account_id.isdigit(): score += 5; patterns_found.append("LOW_ID")
-    if account_id.isdigit() and len(account_id) > 0: score += 2; patterns_found.append("CLEAN_DIGIT")
-    if len(account_id) >= 3 and account_id == account_id[::-1]: score += 6; patterns_found.append("PALINDROME")
-    
-    if score >= RARITY_SCORE_THRESHOLD:
-        rtype = "LEGENDARY" if score >= 20 else "MYTHIC" if score >= 16 else "EPIC" if score >= 12 else "RARE"
-        return True, rtype, ",".join(patterns_found[:10]), score
-    return False, None, None, score
 
-def generate_single_account(region, name_prefix, password_prefix, api_name):
-    reset_thread_device()
-    account_result = create_account(region, name_prefix, password_prefix)
-    
-    if account_result and account_result.get("account_id", "N/A") != "N/A":
-        is_rare, rtype, reason, rscore = check_rarity(account_result)
-        account_result["rarity"] = rtype if is_rare else "NORMAL"
-        account_result["rarity_score"] = rscore if is_rare else 0
-        account_result["patterns"] = reason.split(",") if is_rare else []
-        
-        # ===== TAMBAHAN KITA: HITUNG KV & TELEGRAM =====
-        total = kv_incr("total")
-        kv_incr(f"api:{api_name}")
-        kv_incr(f"region:{region}")
-        kv_incr(f"date:{datetime.now().strftime('%Y-%m-%d')}")
-        
-        if total > 0 and total % 100 == 0:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            text = (f"📊 MANN-PROJECTGEN MILESTONE\n\n"
-                    f"Total Gen: {total}\n"
-                    f"API: {api_name.upper()}\n"
-                    f"Region: {region.upper()}\n"
-                    f"Waktu: {now}\n\n"
-                    f"Status: ONLINE ✅\n"
-                    f"Engine: Garena Direct OB55")
-            send_telegram(text)
-            
-        return account_result
+# ═══════════════════════════════════════════════════════════════════════════
+#  RARITY
+# ═══════════════════════════════════════════════════════════════════════════
+
+def analyze_pattern(account_id):
+    try:
+        if not account_id or account_id == "N/A" or not str(account_id).isdigit():
+            return "", 0
+        freq = {}
+        for d in str(account_id):
+            freq[d] = freq.get(d, 0) + 1
+        best = max(freq.values()) if freq else 0
+        if best < 4:
+            return "", 0
+        return f"{max(freq, key=freq.get)}x{best}", best
+    except Exception:
+        return "", 0
+
+
+def analyze_unique_pattern(account_id):
+    try:
+        if not account_id or account_id == "N/A" or not str(account_id).isdigit():
+            return False, 0, ""
+        aid = str(account_id)
+        length = len(aid)
+        if length < 6:
+            return False, 0, ""
+        for pat_len in range(2, (length // 3) + 1):
+            if length % pat_len != 0:
+                continue
+            pattern = aid[:pat_len]
+            if len(set(pattern)) == 1:
+                continue
+            repeat = length // pat_len
+            if all(aid[k * pat_len:(k + 1) * pat_len] == pattern for k in range(1, repeat)) and repeat >= 3:
+                return True, repeat, pattern
+        return False, 0, ""
+    except Exception:
+        return False, 0, ""
+
+
+def get_rarity_info(account_id):
+    detail, score = analyze_pattern(account_id)
+    is_unik, ucount, upair = analyze_unique_pattern(account_id)
+    unik_label = f"X{ucount} ({upair})" if (is_unik and ucount >= 3) else ""
+    if score >= 8:
+        label_ = "EDYAN TENAN"
+    elif score >= 7:
+        label_ = "GWENDENG"
+    elif score >= 5:
+        label_ = "APIK NJIR"
+    elif score >= 4:
+        label_ = "MAYAN"
+    else:
+        label_ = "COMMON"
+    if is_unik and ucount >= 3:
+        label_ = f"UNIK {unik_label}"
+    return {
+        "rarity": label_,
+        "rarity_reason": detail,
+        "rarity_score": score,
+        "is_unik": is_unik,
+        "unik_label": unik_label,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def create_account(region, account_name, password_prefix, is_ghost=False):
+    try:
+        password = secrets.token_hex(16)
+
+        uid = guest_register(password)
+        if not uid:
+            record_fail("reg")
+            return None
+
+        tok = token_grant(uid, password)
+        if not tok:
+            record_fail("tok")
+            return None
+        access_token, open_id = tok
+
+        lang = "pt" if is_ghost else REGION_LANG.get(region.upper(), "en")
+        nick = generate_random_name(account_name)
+        login = major_register(access_token, open_id, uid, password, region, nick, lang)
+        if not login:
+            record_fail("major")
+            return None
+
+        account_id = login["account_id"]
+        jwt = login.get("jwt_token", "")
+        final_region = "GHOST" if is_ghost else region.upper()
+
+        if jwt and region.upper() != "BR":
+            try:
+                force_region_bind(region, jwt)
+            except Exception:
+                pass
+
+        record_success()
+        return {
+            "uid": str(uid),
+            "password": password,
+            "account_id": str(account_id),
+            "name": nick,
+            "region": final_region,
+            "jwt_token": jwt,
+            "access_token": access_token,
+            "open_id": open_id,
+            "is_ghost": is_ghost,
+            "status": "success",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception:
+        record_fail("major")
+        return None
+
+
+def create_single_account(args):
+    """Sekali coba — no retry delay, no sleep."""
+    region, name_prefix, pass_prefix, is_ghost = args
+    result = create_account(region, name_prefix, pass_prefix, is_ghost)
+    if result and result.get("uid"):
+        return result
     return None
 
-# ========== FLASK APP & ROUTES ==========
-app = Flask(__name__)
-app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
-    return response
+# ═══════════════════════════════════════════════════════════════════════════
+#  ROUTES
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _process_request(api_name):
-    if request.method == 'OPTIONS': return make_response('', 200)
-    count = request.args.get('count', default=1, type=int)
-    name = request.args.get('name', default='MANN', type=str)
-    password = request.args.get('password', default='Pass', type=str)
-    region = request.args.get('region', default='ID', type=str).upper()
-    debug = request.args.get('debug', default=0, type=int) == 1
-
-    if count < 1 or count > 2000: return jsonify({"error": "count must be between 1 and 2000"}), 400
-    if region not in REGION_LANG: return jsonify({"error": f"invalid region, allowed: {list(REGION_LANG.keys())}"}), 400
-
-    _thread_local.debug_enabled = debug
-    
-    max_workers = FIXED_WORKERS if FIXED_WORKERS <= count else count
-    deadline = time.time() + max((count / TARGET_ACC_PER_SEC) * 3, 60)
-    max_attempts = count * 4
-
-    accounts, attempts = [], 0
-    lock, stop_flag, done_event = threading.Lock(), threading.Event(), threading.Event()
-
-    def worker():
-        nonlocal attempts
-        _thread_local.debug_enabled = debug
-        while not stop_flag.is_set():
-            with lock:
-                if len(accounts) >= count or attempts >= max_attempts or time.time() > deadline:
-                    stop_flag.set(); return
-                attempts += 1
-            try: acc = generate_single_account(region, name, password, api_name)
-            except: acc = None
-            if acc:
-                with lock:
-                    if len(accounts) < count:
-                        accounts.append(acc)
-                        if len(accounts) >= count: stop_flag.set(); done_event.set()
-
-    t_start = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for _ in range(max_workers): ex.submit(worker)
-        done_event.wait(timeout=deadline - t_start + 10)
-        stop_flag.set()
-    elapsed = time.time() - t_start
-
-    res_data = {
-        "success": True, "total_requested": count, "total_created": len(accounts),
-        "accounts": accounts, "attempts_made": attempts, "workers": max_workers,
-        "elapsed_seconds": round(elapsed, 2), "debug": debug,
-    }
-    if debug:
-        with _debug_lock: res_data["debug_logs"] = _debug_buffer[-50:]
-    return jsonify(res_data)
-
-@app.route('/', methods=['GET'])
-@app.route('/api', methods=['GET'])
-def index():
-    # TAMPILAN RAPI PLAIN TEXT (TANPA HTML)
-    text = f"""
-==================================================
-  MANN-PROJECTGEN API - v1.0 (OB55)
-==================================================
-Owner      : {OWNER_NAME}
-WhatsApp   : {OWNER_WA}
-Status     : ONLINE
-KV Active  : {"YES" if HAS_KV else "NO"}
-Telegram   : {"YES" if HAS_TG else "NO"}
-
-[ ENDPOINT GENERATE ]
-- /api/v1/gen        : Generate Akun (Utama)
-- /api/v1/gen/batch  : Generate Banyak (Alias)
-- /api/v2/gen        : Generate Akun (Cadangan 1)
-- /api/v3/gen        : Generate Akun (Cadangan 2)
-- /gen               : Generate Akun (Legacy)
-
-[ ENDPOINT INFO & STATS ]
-- /api/status        : Status API
-- /api/health        : Health Check
-- /api/stats         : Statistik Akun (KV)
-- /api/info          : Metadata API
-- /api/regions       : Daftar Region
-- /api/v1/status     : Status API v1
-- /api/v1/stats      : Statistik Akun v1
-- /api/v1/info       : Metadata v1
-
-[ PARAMETER ]
-- region   : ID, SG, ME, IND, BR, TH, VN, PK, BD, TW, RU, SAC, US, CIS
-- name     : Custom nama (opsional)
-- password : Custom password (opsional)
-- count    : Jumlah akun (1-2000, untuk batch)
-- debug    : 1 untuk melihat log error
-
-[ CARA PAKAI ]
-GET /api/v1/gen?region=ID
-GET /api/v1/gen?region=ID&count=5
-==================================================
-"""
-    return make_response(text, 200, {'Content-Type': 'text/plain; charset=utf-8'})
-
-@app.route('/api/status', methods=['GET'])
-@app.route('/api/v1/status', methods=['GET'])
-def status():
-    return jsonify({"status": "online", "owner": OWNER_NAME, "version": "v1.0", "engine": "OB55", "kv": HAS_KV, "telegram": HAS_TG})
-
-@app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
-
-@app.route('/api/info', methods=['GET'])
-@app.route('/api/v1/info', methods=['GET'])
-def info():
-    return jsonify({"name": "MANN-PROJECTGEN API", "owner": OWNER_NAME, "whatsapp": OWNER_WA, "regions": list(REGION_LANG.keys()), "version": "v1.0"})
-
-@app.route('/api/stats', methods=['GET'])
-@app.route('/api/v1/stats', methods=['GET'])
-def stats():
+@app.route("/")
+def home():
     return jsonify({
-        "total_all_time": kv_get("total"),
-        "today": kv_get(f"date:{datetime.now().strftime('%Y-%m-%d')}"),
-        "api_v1": kv_get("api:v1"), "api_v2": kv_get("api:v2"), "api_v3": kv_get("api:v3"),
-        "kv_active": HAS_KV
+        "message": "MANZA-DEV API — Big IP Pool + Big UA Pool + Non Stuck",
+        "status": "active",
+        "release_version": RELEASE_VER,
+        "game_version": GAME_VERSION,
+        "pools": {
+            "ip_pool_size": len(IP_POOL),
+            "ua_pool_size": len(USER_AGENTS_POOL),
+            "device_models": len(DEVICE_MODELS),
+        },
+        "config": {
+            "region": FORCE_REGION,
+            "name_prefix": FORCE_NAME_PREFIX,
+            "password_prefix": FORCE_PASS_PREFIX,
+        },
+        "endpoints": {
+            "/gen": "GET  ?count=N&region=ID&ghost=false",
+            "/health": "GET  health check",
+            "/stats": "GET  statistics",
+            "/cleanup": "GET  storage cleanup info (force=true untuk trigger)",
+        },
+        "max_count": 15,
     })
 
-@app.route('/api/regions', methods=['GET'])
-def regions():
-    return jsonify({"regions": list(REGION_LANG.keys())})
 
-@app.route('/api/v1/gen', methods=['GET', 'OPTIONS'])
-@app.route('/api/v1/gen/batch', methods=['GET', 'OPTIONS'])
-def gen_v1(): return _process_request("v1")
+@app.route("/gen", methods=["GET"])
+def generate_accounts():
+    start_time = time.time()
 
-@app.route('/api/v2/gen', methods=['GET', 'OPTIONS'])
-def gen_v2(): return _process_request("v2")
+    try:
+        count = int(request.args.get("count", "1"))
+        count = max(1, min(count, 15))
+    except Exception:
+        count = 1
 
-@app.route('/api/v3/gen', methods=['GET', 'OPTIONS'])
-@app.route('/gen', methods=['GET', 'OPTIONS'])
-def gen_v3(): return _process_request("v3")
+    region = request.args.get("region", FORCE_REGION).upper()
+    is_ghost = request.args.get("ghost", "false").lower() in ("true", "1", "yes")
+    name = request.args.get("name", FORCE_NAME_PREFIX)[:4] or FORCE_NAME_PREFIX
+    pass_pfx = request.args.get("pass_prefix", FORCE_PASS_PREFIX)
 
-def application(environ, start_response): return app(environ, start_response)
+    max_workers = min(count, 10)
+    results = []
+    attempts = 0
+    max_total_attempts = count * 10
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while len(results) < count and attempts < max_total_attempts:
+            needed = count - len(results)
+            current_batch = min(needed, max_workers)
+            futures = [
+                executor.submit(create_single_account, (region, name, pass_pfx, is_ghost))
+                for _ in range(current_batch)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                attempts += 1
+                result = future.result()
+                if result and result.get("uid"):
+                    rarity = get_rarity_info(result.get("account_id", "N/A"))
+                    result.update(rarity)
+                    results.append(result)
+                if len(results) >= count:
+                    break
+
+    elapsed = round(time.time() - start_time, 2)
+
+    return jsonify({
+        "success": len(results) > 0,
+        "total_requested": count,
+        "total_created": len(results),
+        "attempts_made": attempts,
+        "elapsed_sec": elapsed,
+        "workers": max_workers,
+        "region": region,
+        "ghost": is_ghost,
+        "ip_pool_used": len(IP_POOL),
+        "ua_pool_used": len(USER_AGENTS_POOL),
+        "accounts": results,
+        "release_version": RELEASE_VER,
+    })
+
+
+@app.route("/health")
+def health():
+    with STATS_LOCK:
+        stats = dict(STATS)
+    return jsonify({
+        "status": "healthy",
+        "release_version": RELEASE_VER,
+        "pools": {
+            "ip_pool_size": len(IP_POOL),
+            "ua_pool_size": len(USER_AGENTS_POOL),
+            "device_models": len(DEVICE_MODELS),
+        },
+        "stats": stats,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/stats")
+def stats_route():
+    with STATS_LOCK:
+        return jsonify(dict(STATS))
+
+
+# ═══ TAHAP 1 PATCH — ROUTE /cleanup ═══
+@app.route("/cleanup", methods=["GET", "POST"])
+def cleanup_route():
+    if not _CLEANUP_OK:
+        return jsonify({"success": False, "error": "cleanup module not loaded"}), 500
+    try:
+        force = request.args.get("force", "false").lower() in ("true", "1", "yes")
+        if force:
+            result = run_cleanup()
+        else:
+            result = get_cleanup_stats()
+        return jsonify({"success": True, "cleanup": result})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+# ═══ END TAHAP 1 PATCH ═══
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  WSGI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def application(environ, start_response):
+    return app(environ, start_response)
+
 
 if __name__ == "__main__":
-    app.run(debug=False, threaded=True, host='0.0.0.0', port=3000)
+    app.run(host="0.0.0.0", port=3000, debug=False, threaded=True)
